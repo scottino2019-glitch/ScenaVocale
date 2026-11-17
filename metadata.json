@@ -1,0 +1,6 @@
+{
+  "name": "Scena Vocale",
+  "description": "Studio deterministico per creare dialoghi realistici a più voci (uomo/donna, donna/donna, uomo/uomo, 3+ personaggi) con sintesi vocale, controllo di tono, ritmo ed enfasi emotiva e download in MP3, senza AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

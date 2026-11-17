@@ -1,0 +1,103 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-size: 16px;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #8da495;
+    color: #1b1e36;
+    font-size: 16px;
+    line-height: 1.55;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Matte contrasting slider for dusty lavender cards */
+input[type="range"].studio-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 9999px;
+  background: #8a839e;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #4e2030;
+  border: 2px solid #d4d0df;
+  box-shadow: 0 1px 3px rgba(27, 30, 54, 0.35);
+  transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s ease;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+  background: #146c60;
+}
+
+input[type="range"].studio-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #4e2030;
+  border: 2px solid #d4d0df;
+  cursor: pointer;
+}
+
+/* Matte contrasting slider for burgundy sidebar */
+input[type="range"].studio-slider-dark {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 9999px;
+  background: #7c4054;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"].studio-slider-dark::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #8da495;
+  border: 2px solid #381522;
+  box-shadow: 0 1px 3px rgba(32, 12, 20, 0.45);
+  transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s ease;
+}
+
+input[type="range"].studio-slider-dark::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+  background: #d8a449;
+}
+
+input[type="range"].studio-slider-dark::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #8da495;
+  border: 2px solid #381522;
+  cursor: pointer;
+}
