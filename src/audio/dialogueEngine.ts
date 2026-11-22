@@ -635,7 +635,12 @@ function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
-const serverTtsAudioCache = new Map<string, AudioBuffer>();
+interface ServerTtsResult {
+  buffer: AudioBuffer;
+  shaped: boolean;
+}
+
+const serverTtsAudioCache = new Map<string, ServerTtsResult>();
 
 function getGoogleTtsCode(lang: LanguageCode): string | null {
   switch (lang) {
@@ -741,12 +746,63 @@ export function computeCharacterPitchMap(characters: Character[]): Map<string, n
   return map;
 }
 
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function decodeAndJoinMp3Segments(segments: string[]): Promise<AudioBuffer> {
+  const decodeCtx = new OfflineAudioContext(2, 1, TARGET_SAMPLE_RATE);
+  const decodedBuffers: AudioBuffer[] = [];
+
+  for (const b64 of segments) {
+    const ab = base64ToArrayBuffer(b64);
+    const buf = await decodeCtx.decodeAudioData(ab);
+    decodedBuffers.push(buf);
+  }
+
+  if (decodedBuffers.length === 1) {
+    return decodedBuffers[0];
+  }
+
+  let totalSec = 0.02;
+  for (const b of decodedBuffers) {
+    totalSec += b.duration + 0.03;
+  }
+
+  const totalFrames = Math.max(1024, Math.ceil(totalSec * TARGET_SAMPLE_RATE));
+  const joinCtx = new OfflineAudioContext(1, totalFrames, TARGET_SAMPLE_RATE);
+
+  let cursor = 0.01;
+  for (const b of decodedBuffers) {
+    const src = joinCtx.createBufferSource();
+    src.buffer = b;
+    const g = joinCtx.createGain();
+    const fade = Math.min(0.008, b.duration * 0.2);
+    g.gain.setValueAtTime(0.0001, cursor);
+    g.gain.linearRampToValueAtTime(1.0, cursor + fade);
+    g.gain.setValueAtTime(1.0, Math.max(cursor + fade, cursor + b.duration - fade));
+    g.gain.linearRampToValueAtTime(0.0001, cursor + b.duration);
+
+    src.connect(g);
+    g.connect(joinCtx.destination);
+    src.start(cursor);
+    cursor += b.duration + 0.025;
+  }
+
+  return joinCtx.startRendering();
+}
+
 async function fetchGoogleServerAudioBuffer(
   text: string,
   tl: string,
   pitchFactor: number,
   rateFactor: number
-): Promise<AudioBuffer> {
+): Promise<ServerTtsResult> {
   const key = `${tl}|${pitchFactor.toFixed(3)}|${rateFactor.toFixed(3)}|${text}`;
   const cached = serverTtsAudioCache.get(key);
   if (cached) return cached;
@@ -757,21 +813,37 @@ async function fetchGoogleServerAudioBuffer(
     body: JSON.stringify({ text, tl, pitchFactor, rateFactor }),
   });
 
+  const contentType = response.headers.get('content-type') || '';
   if (!response.ok) {
     const errText = await response.text().catch(() => '');
     throw new Error(errText || `Errore TTS server (${response.status})`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  const decodeCtx = new OfflineAudioContext(2, 1, TARGET_SAMPLE_RATE);
-  const decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+  let result: ServerTtsResult;
+  if (contentType.includes('application/json')) {
+    const payload = (await response.json()) as {
+      shaped?: boolean;
+      segments?: string[];
+      error?: string;
+    };
+    if (!Array.isArray(payload.segments) || payload.segments.length === 0) {
+      throw new Error(payload.error || 'Risposta audio vuota dal server.');
+    }
+    const buffer = await decodeAndJoinMp3Segments(payload.segments);
+    result = { buffer, shaped: Boolean(payload.shaped) };
+  } else {
+    const ab = await response.arrayBuffer();
+    const decodeCtx = new OfflineAudioContext(2, 1, TARGET_SAMPLE_RATE);
+    const buffer = await decodeCtx.decodeAudioData(ab.slice(0));
+    result = { buffer, shaped: false };
+  }
 
   if (serverTtsAudioCache.size > 120) {
     const firstKey = serverTtsAudioCache.keys().next().value;
     if (firstKey) serverTtsAudioCache.delete(firstKey);
   }
-  serverTtsAudioCache.set(key, decoded);
-  return decoded;
+  serverTtsAudioCache.set(key, result);
+  return result;
 }
 
 async function renderGoogleServerLineToStereoBuffer(
@@ -816,19 +888,48 @@ async function renderGoogleServerLineToStereoBuffer(
   const rateFactor = clamp(character.baseRate * (1 + line.rateOffset / 100), 0.65, 1.55);
   const lineVolMult = clamp((line.volumePercent ?? 100) / 100, 0.35, 1.0);
 
-  const timelineItems: { buffer?: AudioBuffer; pauseSec: number }[] = [];
+  const timelineItems: {
+    buffer?: AudioBuffer;
+    playbackRate: number;
+    pauseSec: number;
+    shaped: boolean;
+  }[] = [];
+
+  let anyUnshaped = false;
   for (const part of parts) {
     if (part.type === 'pause') {
-      timelineItems.push({ pauseSec: part.pauseSec });
+      timelineItems.push({ pauseSec: part.pauseSec, playbackRate: 1.0, shaped: true });
       continue;
     }
-    const audioBuf = await fetchGoogleServerAudioBuffer(
+    const { buffer: audioBuf, shaped } = await fetchGoogleServerAudioBuffer(
       part.text,
       tl,
       pitchFactor,
       rateFactor
     );
-    timelineItems.push({ buffer: audioBuf, pauseSec: 0.04 });
+    if (!shaped) anyUnshaped = true;
+
+    // When server has no ffmpeg (e.g. Vercel serverless), apply subtle clean resampling
+    // without metallic phase distortion: gentle male warmth/rate + user speed offset
+    let playbackRate = 1.0;
+    if (!shaped) {
+      const subtleGenderFactor =
+        character.gender === 'male'
+          ? pitchFactor < 0.83
+            ? 0.88
+            : 0.92
+          : pitchFactor > 1.02
+            ? 1.04
+            : 1.0;
+      playbackRate = clamp(subtleGenderFactor * rateFactor, 0.72, 1.45);
+    }
+
+    timelineItems.push({
+      buffer: audioBuf,
+      playbackRate,
+      pauseSec: 0.04,
+      shaped,
+    });
   }
 
   if (timelineItems.length === 0) {
@@ -843,7 +944,7 @@ async function renderGoogleServerLineToStereoBuffer(
   const reverbTailSec = ambience === 'dry' ? 0.04 : ambience === 'studio' ? 0.18 : 0.38;
   let totalSec = 0.02;
   for (const item of timelineItems) {
-    if (item.buffer) totalSec += item.buffer.duration;
+    if (item.buffer) totalSec += item.buffer.duration / item.playbackRate;
     totalSec += item.pauseSec;
   }
   totalSec += reverbTailSec;
@@ -856,6 +957,16 @@ async function renderGoogleServerLineToStereoBuffer(
 
   const masterGain = offline.createGain();
   masterGain.gain.value = 0.92;
+
+  let outputTarget: AudioNode = panner;
+  if (anyUnshaped && character.gender === 'male') {
+    const warmth = offline.createBiquadFilter();
+    warmth.type = 'lowshelf';
+    warmth.frequency.value = 185;
+    warmth.gain.value = 2.5;
+    warmth.connect(panner);
+    outputTarget = warmth;
+  }
 
   panner.connect(masterGain);
   masterGain.connect(offline.destination);
@@ -876,9 +987,10 @@ async function renderGoogleServerLineToStereoBuffer(
     if (item.buffer) {
       const src = offline.createBufferSource();
       src.buffer = item.buffer;
+      src.playbackRate.value = item.playbackRate;
 
       const segGain = offline.createGain();
-      const dur = item.buffer.duration;
+      const dur = item.buffer.duration / item.playbackRate;
       const fadeIn = Math.min(0.01, dur * 0.2);
       const fadeOut = Math.min(0.014, dur * 0.2);
       const sustainEnd = Math.max(cursorTime + fadeIn, cursorTime + dur - fadeOut);
@@ -889,7 +1001,7 @@ async function renderGoogleServerLineToStereoBuffer(
       segGain.gain.linearRampToValueAtTime(0.0001, cursorTime + dur);
 
       src.connect(segGain);
-      segGain.connect(panner);
+      segGain.connect(outputTarget);
       src.start(cursorTime);
 
       cursorTime += dur;
@@ -925,6 +1037,11 @@ export async function renderLineToStereoBuffer(
   ambience: RoomAmbience,
   pitchFactor = 1.0
 ): Promise<AudioBuffer> {
+  const tl = getGoogleTtsCode(character.language);
+  if (!tl) {
+    return renderMeSpeakLineToStereoBuffer(line, character, ambience);
+  }
+
   try {
     const googleBuf = await renderGoogleServerLineToStereoBuffer(
       line,
@@ -933,8 +1050,11 @@ export async function renderLineToStereoBuffer(
       pitchFactor
     );
     if (googleBuf) return googleBuf;
-  } catch {
-    // Fallback smoothly to deterministic offline synthesis only when network/server fails
+  } catch (err) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      return renderMeSpeakLineToStereoBuffer(line, character, ambience);
+    }
+    throw err;
   }
   return renderMeSpeakLineToStereoBuffer(line, character, ambience);
 }
