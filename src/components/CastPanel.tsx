@@ -395,27 +395,29 @@ export function CastPanel({
                     </button>
                   </div>
 
-                  {/* Offline MP3 controls only shown when Sintesi Offline is active */}
+                  {/* Studio MP3 controls */}
                   {engine === 'studio' && (
                     <>
-                      <div>
-                        <label className="block text-sm font-semibold text-[#DFC5CE] mb-1.5">
-                          Timbro Sintesi Offline (MP3)
-                        </label>
-                        <select
-                          value={char.variant}
-                          onChange={(e) =>
-                            onUpdateCharacter(char.id, { variant: e.target.value })
-                          }
-                          className="w-full px-3 py-2 text-[15px] text-[#EEDFE4] bg-[#3A1522] border border-[#8A475D] rounded-lg focus:outline-none focus:border-[#E8C27A]"
-                        >
-                          {variants.map((v) => (
-                            <option key={v.id} value={v.id}>
-                              {v.label} — {v.hint}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
+                      {char.language === 'eo' && (
+                        <div>
+                          <label className="block text-sm font-semibold text-[#DFC5CE] mb-1.5">
+                            Timbro Sintesi Esperanto (MP3)
+                          </label>
+                          <select
+                            value={char.variant}
+                            onChange={(e) =>
+                              onUpdateCharacter(char.id, { variant: e.target.value })
+                            }
+                            className="w-full px-3 py-2 text-[15px] text-[#EEDFE4] bg-[#3A1522] border border-[#8A475D] rounded-lg focus:outline-none focus:border-[#E8C27A]"
+                          >
+                            {variants.map((v) => (
+                              <option key={v.id} value={v.id}>
+                                {v.label} — {v.hint}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
 
                       <div>
                         <div className="flex items-center justify-between text-sm mb-1.5">

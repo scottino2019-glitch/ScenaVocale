@@ -113,7 +113,7 @@ export function ScriptEditor({
                       : 'text-[#1B1E36] hover:text-[#4E2030]'
                   }`}
                 >
-                  Sintesi Offline (MP3)
+                  Voci Google Studio (MP3)
                 </button>
               </div>
             </div>
@@ -168,7 +168,7 @@ export function ScriptEditor({
 
         {project.engine === 'webspeech' && !hasSystemVoices && (
           <p className="mt-3 text-sm font-semibold text-[#3B2642]">
-            Questo ambiente browser non espone voci Google/Android native: la riproduzione usa automaticamente la sintesi offline. Su Chrome desktop o Android vedrai tutte le voci Google del dispositivo.
+            Questo ambiente browser non espone voci Google/Android locali: l’ascolto e l’esportazione MP3 usano automaticamente le Voci Google Studio dal server.
           </p>
         )}
       </section>

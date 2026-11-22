@@ -16,7 +16,6 @@ import {
   DialoguePlaybackController,
   estimateProjectDurationSec,
   exportDialogueToMp3,
-  recordGoogleDialogueToMp3,
 } from './audio/dialogueEngine';
 import { TopBar } from './components/TopBar';
 import { CastPanel } from './components/CastPanel';
@@ -25,7 +24,6 @@ import { TransportBar } from './components/TransportBar';
 import { TemplatesModal } from './components/TemplatesModal';
 import { ProsodyGuideModal } from './components/ProsodyGuideModal';
 import { GoogleVoicesModal } from './components/GoogleVoicesModal';
-import { ExportMp3Modal } from './components/ExportMp3Modal';
 import { detectVoiceGender, mapVoiceLangToLanguageCode } from './utils/googleVoices';
 
 const STORAGE_KEY = 'scena-vocale-project-v6';
@@ -69,7 +67,6 @@ export default function App() {
   const [activeSection, setActiveSection] = useState<'script' | 'cast'>('script');
   const [isTemplatesOpen, setIsTemplatesOpen] = useState(false);
   const [isGuideOpen, setIsGuideOpen] = useState(false);
-  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [voiceCatalogCharId, setVoiceCatalogCharId] = useState<string | null>(null);
   const [previewingVoiceUri, setPreviewingVoiceUri] = useState<string | null>(null);
 
@@ -449,8 +446,22 @@ export default function App() {
     });
   }, [handleStopPlayback, isPlaying, project]);
 
-  const triggerMp3Download = useCallback(
-    (result: { blob: Blob; fileName: string }) => {
+  const handleExportMp3 = useCallback(async () => {
+    setErrorMsg(null);
+    const hasText = project.lines.some((l) => l.text.trim().length > 0);
+    if (!hasText) {
+      setErrorMsg('Aggiungi almeno una battuta con testo prima di esportare.');
+      return;
+    }
+
+    handleStopPlayback();
+    setExportProgress({ percent: 0, stage: 'Preparazione voci Google MP3...' });
+
+    try {
+      const result = await exportDialogueToMp3(project, (percent, stage) => {
+        setExportProgress({ percent, stage });
+      });
+
       const objectUrl = URL.createObjectURL(result.blob);
       setLastExportUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev.url);
@@ -467,30 +478,6 @@ export default function App() {
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);
-    },
-    []
-  );
-
-  const handleOpenExportModal = useCallback(() => {
-    setErrorMsg(null);
-    const hasText = project.lines.some((l) => l.text.trim().length > 0);
-    if (!hasText) {
-      setErrorMsg('Aggiungi almeno una battuta con testo prima di esportare.');
-      return;
-    }
-    setIsExportModalOpen(true);
-  }, [project.lines]);
-
-  const handleExportOfflineMp3 = useCallback(async () => {
-    setErrorMsg(null);
-    handleStopPlayback();
-    setExportProgress({ percent: 0, stage: 'Preparazione sintesi offline...' });
-
-    try {
-      const result = await exportDialogueToMp3(project, (percent, stage) => {
-        setExportProgress({ percent, stage });
-      });
-      triggerMp3Download(result);
     } catch (err) {
       setErrorMsg(
         err instanceof Error
@@ -500,39 +487,7 @@ export default function App() {
     } finally {
       setExportProgress(null);
     }
-  }, [handleStopPlayback, project, triggerMp3Download]);
-
-  const handleRecordGoogleMp3 = useCallback(async () => {
-    setErrorMsg(null);
-    handleStopPlayback();
-    setIsPlaying(true);
-    setExportProgress({ percent: 2, stage: 'Seleziona "Condividi audio di sistema"...' });
-
-    try {
-      const result = await recordGoogleDialogueToMp3(
-        project,
-        playerRef.current!,
-        (percent, stage) => {
-          setExportProgress({ percent, stage });
-        },
-        (lineId, idx) => {
-          setActiveLineId(lineId);
-          setActiveLineIndex(idx);
-        }
-      );
-      triggerMp3Download(result);
-    } catch (err) {
-      setErrorMsg(
-        err instanceof Error
-          ? err.message
-          : 'Registrazione voci Google non riuscita.'
-      );
-    } finally {
-      setIsPlaying(false);
-      setActiveLineId(null);
-      setExportProgress(null);
-    }
-  }, [handleStopPlayback, project, triggerMp3Download]);
+  }, [handleStopPlayback, project]);
 
   const handleSelectTemplate = useCallback(
     (tpl: DialogueTemplate) => {
@@ -569,7 +524,7 @@ export default function App() {
         onSelectSection={setActiveSection}
         onOpenTemplates={() => setIsTemplatesOpen(true)}
         onOpenGuide={() => setIsGuideOpen(true)}
-        onExportMp3={handleOpenExportModal}
+        onExportMp3={handleExportMp3}
         isExporting={Boolean(exportProgress)}
         hasLines={project.lines.some((l) => l.text.trim().length > 0)}
       />
@@ -671,7 +626,7 @@ export default function App() {
         exportProgress={exportProgress}
         lastExportUrl={lastExportUrl}
         onTogglePlayAll={handleTogglePlayAll}
-        onExportMp3={handleOpenExportModal}
+        onExportMp3={handleExportMp3}
       />
 
       <TemplatesModal
@@ -699,19 +654,6 @@ export default function App() {
         onRefreshVoices={refreshSystemVoices}
         onPreviewVoice={handlePreviewCatalogVoice}
         onAssignVoice={handleAssignCatalogVoice}
-      />
-
-      <ExportMp3Modal
-        isOpen={isExportModalOpen}
-        engine={project.engine}
-        hasSystemVoices={systemVoices.length > 0}
-        mp3Bitrate={project.mp3Bitrate}
-        estimatedDurationSec={estimatedDurationSec}
-        lineCount={project.lines.filter((l) => l.text.trim().length > 0).length}
-        isExporting={Boolean(exportProgress)}
-        onClose={() => setIsExportModalOpen(false)}
-        onRecordGoogleMp3={handleRecordGoogleMp3}
-        onExportOfflineMp3={handleExportOfflineMp3}
       />
     </div>
   );

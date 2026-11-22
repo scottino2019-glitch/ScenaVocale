@@ -635,7 +635,311 @@ function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
+const serverTtsAudioCache = new Map<string, AudioBuffer>();
+
+function getGoogleTtsCode(lang: LanguageCode): string | null {
+  switch (lang) {
+    case 'it':
+      return 'it';
+    case 'en/en':
+    case 'en/en-rp':
+    case 'en/en-sc':
+    case 'en/en-n':
+    case 'en/en-wm':
+      return 'en-GB';
+    case 'en/en-us':
+      return 'en-US';
+    case 'fr':
+      return 'fr-FR';
+    case 'es':
+      return 'es-ES';
+    case 'es-la':
+      return 'es-MX';
+    case 'pt':
+      return 'pt-BR';
+    case 'pt-pt':
+      return 'pt-PT';
+    case 'de':
+      return 'de';
+    case 'nl':
+      return 'nl';
+    case 'ca':
+      return 'ca';
+    case 'ro':
+      return 'ro';
+    case 'el':
+      return 'el';
+    case 'sv':
+      return 'sv';
+    case 'fi':
+      return 'fi';
+    case 'hu':
+      return 'hu';
+    case 'lv':
+      return 'lv';
+    case 'la':
+      return 'la';
+    case 'eo':
+      return null;
+    case 'pl':
+      return 'pl';
+    case 'cs':
+      return 'cs';
+    case 'sk':
+      return 'sk';
+    case 'ru':
+      return 'ru';
+    case 'uk':
+      return 'uk';
+    case 'bg':
+      return 'bg';
+    case 'hr':
+      return 'hr';
+    case 'zh':
+      return 'zh-CN';
+    case 'zh-yue':
+      return 'zh-TW';
+    case 'ja':
+      return 'ja';
+    case 'ko':
+      return 'ko';
+    case 'tr':
+      return 'tr';
+    case 'kn':
+      return 'kn';
+    case 'ar':
+      return 'ar';
+    case 'hi':
+      return 'hi';
+    case 'vi':
+      return 'vi';
+    default:
+      return 'it';
+  }
+}
+
+export function computeCharacterPitchMap(characters: Character[]): Map<string, number> {
+  const map = new Map<string, number>();
+  const maleFactors = [0.86, 0.80, 0.90];
+  const maleEnGbFactors = [0.95, 0.89, 1.00];
+  const femaleFactors = [1.00, 1.06, 0.96];
+
+  let maleIdx = 0;
+  let femaleIdx = 0;
+
+  for (const c of characters) {
+    const tl = getGoogleTtsCode(c.language);
+    if (c.gender === 'male') {
+      const palette = tl === 'en-GB' ? maleEnGbFactors : maleFactors;
+      map.set(c.id, palette[maleIdx % palette.length]);
+      maleIdx++;
+    } else {
+      map.set(c.id, femaleFactors[femaleIdx % femaleFactors.length]);
+      femaleIdx++;
+    }
+  }
+  return map;
+}
+
+async function fetchGoogleServerAudioBuffer(
+  text: string,
+  tl: string,
+  pitchFactor: number,
+  rateFactor: number
+): Promise<AudioBuffer> {
+  const key = `${tl}|${pitchFactor.toFixed(3)}|${rateFactor.toFixed(3)}|${text}`;
+  const cached = serverTtsAudioCache.get(key);
+  if (cached) return cached;
+
+  const response = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, tl, pitchFactor, rateFactor }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(errText || `Errore TTS server (${response.status})`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const decodeCtx = new OfflineAudioContext(2, 1, TARGET_SAMPLE_RATE);
+  const decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+
+  if (serverTtsAudioCache.size > 120) {
+    const firstKey = serverTtsAudioCache.keys().next().value;
+    if (firstKey) serverTtsAudioCache.delete(firstKey);
+  }
+  serverTtsAudioCache.set(key, decoded);
+  return decoded;
+}
+
+async function renderGoogleServerLineToStereoBuffer(
+  line: DialogueLine,
+  character: Character,
+  ambience: RoomAmbience,
+  pitchFactor: number
+): Promise<AudioBuffer | null> {
+  const tl = getGoogleTtsCode(character.language);
+  if (!tl) return null;
+
+  const tokenRegex = /\[pausa\s+(\d+(?:\.\d+)?)\s*(ms|s)?\]/gi;
+  const parts: ({ type: 'speech'; text: string } | { type: 'pause'; pauseSec: number })[] = [];
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tokenRegex.exec(line.text)) !== null) {
+    if (match.index > lastIdx) {
+      const segText = line.text
+        .slice(lastIdx, match.index)
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (segText) parts.push({ type: 'speech', text: segText });
+    }
+    const num = parseFloat(match[1]);
+    const unit = (match[2] || 'ms').toLowerCase();
+    const ms = Math.min(4000, Math.max(50, unit === 's' ? num * 1000 : num));
+    parts.push({ type: 'pause', pauseSec: ms / 1000 });
+    lastIdx = match.index + match[0].length;
+  }
+
+  if (lastIdx < line.text.length) {
+    const tailText = line.text
+      .slice(lastIdx)
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (tailText) parts.push({ type: 'speech', text: tailText });
+  }
+
+  const rateFactor = clamp(character.baseRate * (1 + line.rateOffset / 100), 0.65, 1.55);
+  const lineVolMult = clamp((line.volumePercent ?? 100) / 100, 0.35, 1.0);
+
+  const timelineItems: { buffer?: AudioBuffer; pauseSec: number }[] = [];
+  for (const part of parts) {
+    if (part.type === 'pause') {
+      timelineItems.push({ pauseSec: part.pauseSec });
+      continue;
+    }
+    const audioBuf = await fetchGoogleServerAudioBuffer(
+      part.text,
+      tl,
+      pitchFactor,
+      rateFactor
+    );
+    timelineItems.push({ buffer: audioBuf, pauseSec: 0.04 });
+  }
+
+  if (timelineItems.length === 0) {
+    const emptyCtx = new OfflineAudioContext(
+      2,
+      Math.floor(TARGET_SAMPLE_RATE * 0.2),
+      TARGET_SAMPLE_RATE
+    );
+    return emptyCtx.startRendering();
+  }
+
+  const reverbTailSec = ambience === 'dry' ? 0.04 : ambience === 'studio' ? 0.18 : 0.38;
+  let totalSec = 0.02;
+  for (const item of timelineItems) {
+    if (item.buffer) totalSec += item.buffer.duration;
+    totalSec += item.pauseSec;
+  }
+  totalSec += reverbTailSec;
+
+  const totalFrames = Math.max(1024, Math.ceil(totalSec * TARGET_SAMPLE_RATE));
+  const offline = new OfflineAudioContext(2, totalFrames, TARGET_SAMPLE_RATE);
+
+  const panner = offline.createStereoPanner();
+  panner.pan.value = clamp(character.pan, -0.75, 0.75);
+
+  const masterGain = offline.createGain();
+  masterGain.gain.value = 0.92;
+
+  panner.connect(masterGain);
+  masterGain.connect(offline.destination);
+
+  const impulse = getRoomImpulse(offline, ambience);
+  if (impulse) {
+    const convolver = offline.createConvolver();
+    convolver.buffer = impulse;
+    const wetGain = offline.createGain();
+    wetGain.gain.value = ambience === 'studio' ? 0.12 : 0.2;
+    panner.connect(convolver);
+    convolver.connect(wetGain);
+    wetGain.connect(offline.destination);
+  }
+
+  let cursorTime = 0.015;
+  for (const item of timelineItems) {
+    if (item.buffer) {
+      const src = offline.createBufferSource();
+      src.buffer = item.buffer;
+
+      const segGain = offline.createGain();
+      const dur = item.buffer.duration;
+      const fadeIn = Math.min(0.01, dur * 0.2);
+      const fadeOut = Math.min(0.014, dur * 0.2);
+      const sustainEnd = Math.max(cursorTime + fadeIn, cursorTime + dur - fadeOut);
+
+      segGain.gain.setValueAtTime(0.0001, cursorTime);
+      segGain.gain.linearRampToValueAtTime(lineVolMult, cursorTime + fadeIn);
+      segGain.gain.setValueAtTime(lineVolMult, sustainEnd);
+      segGain.gain.linearRampToValueAtTime(0.0001, cursorTime + dur);
+
+      src.connect(segGain);
+      segGain.connect(panner);
+      src.start(cursorTime);
+
+      cursorTime += dur;
+    }
+    cursorTime += item.pauseSec;
+  }
+
+  const rendered = await offline.startRendering();
+  let maxPeak = 0;
+  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
+    const data = rendered.getChannelData(ch);
+    for (let i = 0; i < data.length; i++) {
+      const a = Math.abs(data[i]);
+      if (a > maxPeak) maxPeak = a;
+    }
+  }
+  if (maxPeak > 0.85) {
+    const scale = 0.85 / maxPeak;
+    for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
+      const data = rendered.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) {
+        data[i] *= scale;
+      }
+    }
+  }
+
+  return rendered;
+}
+
 export async function renderLineToStereoBuffer(
+  line: DialogueLine,
+  character: Character,
+  ambience: RoomAmbience,
+  pitchFactor = 1.0
+): Promise<AudioBuffer> {
+  try {
+    const googleBuf = await renderGoogleServerLineToStereoBuffer(
+      line,
+      character,
+      ambience,
+      pitchFactor
+    );
+    if (googleBuf) return googleBuf;
+  } catch {
+    // Fallback smoothly to deterministic offline synthesis only when network/server fails
+  }
+  return renderMeSpeakLineToStereoBuffer(line, character, ambience);
+}
+
+async function renderMeSpeakLineToStereoBuffer(
   line: DialogueLine,
   character: Character,
   ambience: RoomAmbience
@@ -944,16 +1248,22 @@ export async function exportDialogueToMp3(
   }
 
   const charMap = new Map(project.characters.map((c) => [c.id, c]));
+  const pitchMap = computeCharacterPitchMap(project.characters);
   const renderedLines: { buffer: AudioBuffer; pauseAfterSec: number }[] = [];
 
   for (let i = 0; i < validLines.length; i++) {
     const line = validLines[i];
     const char = charMap.get(line.characterId) || project.characters[0];
     onProgress?.(
-      Math.round((i / validLines.length) * 55),
-      `Sintesi battuta ${i + 1} di ${validLines.length} (${char.name})...`
+      Math.round((i / validLines.length) * 58),
+      `Generazione voce Google ${i + 1} di ${validLines.length} (${char.name})...`
     );
-    const buffer = await renderLineToStereoBuffer(line, char, project.ambience);
+    const buffer = await renderLineToStereoBuffer(
+      line,
+      char,
+      project.ambience,
+      pitchMap.get(char.id) ?? 1.0
+    );
     renderedLines.push({
       buffer,
       pauseAfterSec: line.pauseAfterMs / 1000,
@@ -961,7 +1271,7 @@ export async function exportDialogueToMp3(
     await new Promise((r) => setTimeout(r, 0));
   }
 
-  onProgress?.(60, 'Masterizzazione traccia stereo...');
+  onProgress?.(64, 'Masterizzazione traccia stereo...');
 
   const leadInSamples = Math.floor(0.15 * TARGET_SAMPLE_RATE);
   const tailOutSamples = Math.floor(0.35 * TARGET_SAMPLE_RATE);
@@ -998,146 +1308,6 @@ export async function exportDialogueToMp3(
     leftMaster,
     rightMaster,
     TARGET_SAMPLE_RATE,
-    project.mp3Bitrate,
-    project.title,
-    onProgress
-  );
-}
-
-export async function recordGoogleDialogueToMp3(
-  project: DialogueProject,
-  controller: DialoguePlaybackController,
-  onProgress?: (percent: number, stage: string) => void,
-  onLineStart?: (lineId: string, index: number) => void
-): Promise<{ blob: Blob; durationSec: number; fileName: string }> {
-  const validLines = project.lines.filter((l) => l.text.trim().length > 0);
-  if (validLines.length === 0) {
-    throw new Error('Aggiungi almeno una battuta con testo prima di esportare.');
-  }
-
-  if (
-    typeof navigator === 'undefined' ||
-    !navigator.mediaDevices ||
-    typeof navigator.mediaDevices.getDisplayMedia !== 'function'
-  ) {
-    throw new Error(
-      'La registrazione audio del sistema non è supportata su questo browser/dispositivo. Usa l’Esportazione MP3 Offline.'
-    );
-  }
-
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: true,
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-    },
-    // @ts-expect-error Chromium screen/system audio hint
-    systemAudio: 'include',
-    preferCurrentTab: true,
-  });
-
-  const audioTracks = stream.getAudioTracks();
-  if (audioTracks.length === 0) {
-    stream.getTracks().forEach((t) => t.stop());
-    throw new Error(
-      'Nessun audio condiviso: riprova selezionando "Condividi audio di sistema" (o "Schermo intero + audio") nella finestra del browser.'
-    );
-  }
-
-  const captureCtx = new AudioContext();
-  if (captureCtx.state === 'suspended') {
-    await captureCtx.resume();
-  }
-
-  const leftChunks: Float32Array[] = [];
-  const rightChunks: Float32Array[] = [];
-  let totalCaptured = 0;
-
-  const source = captureCtx.createMediaStreamSource(stream);
-  const recorderNode = captureCtx.createScriptProcessor(4096, 2, 2);
-  const silentSink = captureCtx.createGain();
-  silentSink.gain.value = 0;
-
-  recorderNode.onaudioprocess = (ev) => {
-    const chL = ev.inputBuffer.getChannelData(0);
-    const chR =
-      ev.inputBuffer.numberOfChannels > 1 ? ev.inputBuffer.getChannelData(1) : chL;
-    leftChunks.push(new Float32Array(chL));
-    rightChunks.push(new Float32Array(chR));
-    totalCaptured += chL.length;
-  };
-
-  source.connect(recorderNode);
-  recorderNode.connect(silentSink);
-  silentSink.connect(captureCtx.destination);
-
-  try {
-    onProgress?.(5, 'Avvio registrazione voci Google / Android...');
-    await new Promise((r) => setTimeout(r, 300));
-
-    const recordProject: DialogueProject = {
-      ...project,
-      engine: 'webspeech',
-    };
-
-    await new Promise<void>((resolve, reject) => {
-      controller.playLines(recordProject, validLines, {
-        onLineStart: (lineId, idx) => {
-          onLineStart?.(lineId, idx);
-          const pct = 10 + Math.round(((idx + 1) / validLines.length) * 55);
-          onProgress?.(
-            pct,
-            `Registrazione voce reale: battuta ${idx + 1} di ${validLines.length}...`
-          );
-        },
-        onFinish: () => resolve(),
-        onCancel: () => reject(new Error('Registrazione interrotta.')),
-        onError: (msg) => reject(new Error(msg)),
-      });
-    });
-
-    await new Promise((r) => setTimeout(r, 400));
-  } finally {
-    recorderNode.onaudioprocess = null;
-    try {
-      source.disconnect();
-      recorderNode.disconnect();
-      silentSink.disconnect();
-    } catch {
-      // Ignore disconnect errors
-    }
-    stream.getTracks().forEach((t) => t.stop());
-  }
-
-  const sampleRate = captureCtx.sampleRate;
-  await captureCtx.close();
-
-  const leftMaster = new Float32Array(totalCaptured);
-  const rightMaster = new Float32Array(totalCaptured);
-  let offset = 0;
-  let capturedPeak = 0;
-  for (let i = 0; i < leftChunks.length; i++) {
-    const l = leftChunks[i];
-    const r = rightChunks[i];
-    leftMaster.set(l, offset);
-    rightMaster.set(r, offset);
-    for (let s = 0; s < l.length; s++) {
-      capturedPeak = Math.max(capturedPeak, Math.abs(l[s]), Math.abs(r[s]));
-    }
-    offset += l.length;
-  }
-
-  if (capturedPeak < 0.002) {
-    throw new Error(
-      'Audio registrato silenzioso: su questo sistema la sintesi vocale OS esce fuori dalla scheda condivisa. Prova "Schermo intero + Condividi audio di sistema" oppure usa l’Esportazione Offline.'
-    );
-  }
-
-  return encodeStereoPcmToMp3(
-    leftMaster,
-    rightMaster,
-    sampleRate,
     project.mp3Bitrate,
     project.title,
     onProgress
@@ -1247,6 +1417,8 @@ export class DialoguePlaybackController {
           this.analyser.connect(this.audioCtx.destination);
         }
 
+        const pitchMap = computeCharacterPitchMap(project.characters);
+
         for (let i = 0; i < linesToPlay.length; i++) {
           if (this.cancelled) break;
           const line = linesToPlay[i];
@@ -1255,7 +1427,12 @@ export class DialoguePlaybackController {
           const char = charMap.get(line.characterId) || project.characters[0];
           callbacks.onLineStart?.(line.id, i);
 
-          const buf = await renderLineToStereoBuffer(line, char, project.ambience);
+          const buf = await renderLineToStereoBuffer(
+            line,
+            char,
+            project.ambience,
+            pitchMap.get(char.id) ?? 1.0
+          );
           if (this.cancelled) break;
 
           await new Promise<void>((resolve) => {
@@ -1279,6 +1456,10 @@ export class DialoguePlaybackController {
           }
         }
       } else {
+        // Brief post-cancel settle so Chromium does not swallow the first utterance
+        await this.waitMs(70);
+        if (this.cancelled) return;
+
         // Assign distinct automatic Google/Android voices per character when systemVoiceUri is unset
         const autoVoiceMap = new Map<string, SpeechSynthesisVoice>();
         const usedUris = new Set<string>();
@@ -1345,17 +1526,27 @@ export class DialoguePlaybackController {
       return;
     }
 
+    await this.waitMs(70);
+    if (this.cancelled) return;
+
     await new Promise<void>((resolve) => {
       const utter = new SpeechSynthesisUtterance(sampleText);
       this.activeUtterance = utter;
+      this.utterResolver = resolve;
       utter.voice = voice;
       utter.lang = voice.lang || 'it-IT';
       utter.pitch = 1.0;
       utter.rate = 1.0;
       utter.volume = 1.0;
 
+      const watchdog = window.setTimeout(() => {
+        finish();
+      }, 15000);
+
       const finish = () => {
+        window.clearTimeout(watchdog);
         if (this.activeUtterance === utter) this.activeUtterance = null;
+        if (this.utterResolver === resolve) this.utterResolver = null;
         resolve();
       };
       utter.onend = finish;
@@ -1439,7 +1630,24 @@ export class DialoguePlaybackController {
         utter.rate = rate;
         utter.volume = volume;
 
+        let settled = false;
+        const maxMs = Math.max(12000, Math.round((seg.text.length * 190) / rate) + 5000);
+        const keepAlive = window.setInterval(() => {
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            try {
+              window.speechSynthesis.resume();
+            } catch {
+              // Ignore resume errors
+            }
+          }
+        }, 8000);
+        const watchdog = window.setTimeout(() => done(), maxMs);
+
         const done = () => {
+          if (settled) return;
+          settled = true;
+          window.clearInterval(keepAlive);
+          window.clearTimeout(watchdog);
           if (this.activeUtterance === utter) this.activeUtterance = null;
           if (this.utterResolver === resolve) this.utterResolver = null;
           resolve();
